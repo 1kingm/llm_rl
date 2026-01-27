@@ -1,0 +1,9 @@
+num_domains: 3
+topology: ring
+intra_bandwidth_gbps: 400.0
+inter_bandwidth_range_gbps: [2.0, 5.0]
+intra_latency_ms: 0.5
+inter_latency_range_ms: [20.0, 100.0]
+bandwidth_fluctuation: 0.3
+latency_jitter: 0.2
+network_aggregation: min

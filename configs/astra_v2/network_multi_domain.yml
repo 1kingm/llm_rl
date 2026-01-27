@@ -1,0 +1,30 @@
+# 多域跨数据中心拓扑配置
+# Multi-domain cross-datacenter topology configuration
+#
+# 设计说明:
+# - 第一维: Switch (域内高速互联) - 模拟数据中心内部 NVSwitch/InfiniBand
+# - 第二维: Ring (域间 WAN 连接) - 模拟跨数据中心广域网
+#
+# 拓扑结构:
+# - 4 个域 (数据中心)
+# - 每域 4 个 GPU
+# - 总计 16 个 NPU
+#
+# 这种 2D 拓扑创建多条路径，启用链路竞争，
+# 使 congestion-aware 和 congestion-unaware 模式产生差异
+
+# 拓扑类型: [域内, 域间]
+topology: [ Switch, Ring ]
+
+# NPU 数量: [每域 GPU 数, 域数]
+npus_count: [ 4, 4 ]
+
+# 带宽 (GB/s): [域内, 域间]
+# 域内: 400 GB/s (3200 Gbps) - NVLink/NVSwitch 级别
+# 域间: 25 GB/s (200 Gbps) - 高速 WAN 连接
+bandwidth: [ 400, 25 ]
+
+# 延迟 (ns): [域内, 域间]
+# 域内: 500 ns (0.5 µs) - 本地互联延迟
+# 域间: 10,000,000 ns (10 ms) - 跨数据中心延迟
+latency: [ 500, 10000000 ]

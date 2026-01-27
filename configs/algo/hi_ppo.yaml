@@ -1,0 +1,72 @@
+# Initial PPO/GAE/GNN hyperparameters (v1.0)
+seed: 42
+device: "cuda"
+
+env:
+  num_domains: 5
+  num_layers: 96
+  use_mock: false
+  backend: "ns3"
+  ns3_build_dir: "astra-sim/extern/network_backend/ns-3-src/build/scratch"
+  ns3_network_config: "astra-sim/extern/network_backend/ns-3-src/scratch/config/config_clos.txt"
+  ns3_comm_group_config: "empty"
+  ns3_bin: "astra-sim/extern/network_backend/ns-3-src/build/scratch/ns3.42-AstraSimNetwork-default"
+  bandwidth_fluctuation: 0.3
+  latency_jitter: 0.2
+  episode_length: 128
+
+hierarchy:
+  high_update_interval: 10
+  low_update_interval: 1
+  high_action: "cut_points"
+  low_action: "dp_tp_pp_placement"
+
+model:
+  policy_hidden_sizes: [256, 256]
+  value_hidden_sizes: [256, 256]
+  activation: "tanh"
+  layer_norm: true
+  dropout: 0.1
+
+gnn:
+  type: "GraphSAGE"
+  num_layers: 2
+  hidden_dim: 128
+  out_dim: 128
+  aggregation: "mean"
+  dropout: 0.1
+
+ppo:
+  lr: 3.0e-4
+  gamma: 0.99
+  gae_lambda: 0.95
+  clip_range: 0.2
+  entropy_coef: 0.01
+  value_coef: 0.5
+  max_grad_norm: 0.5
+  target_kl: 0.02
+  num_steps: 2048
+  update_epochs: 10
+  minibatch_size: 256
+  normalize_adv: true
+  vf_clip: 0.2
+  clip_range_vf: 0.2
+  anneal_lr: true
+
+training:
+  total_timesteps: 2000000
+  eval_interval: 50000
+  save_interval: 100000
+  log_interval: 1000
+
+reward:
+  w_eff: 0.4
+  w_util: 0.3
+  w_cost: 0.3
+
+constraints:
+  coord_latency_s: 1.0
+  intra_latency_ms: 100
+  inter_latency_s: 1.0
+  load_fluctuation_pct: 20
+  stability_target: 0.99

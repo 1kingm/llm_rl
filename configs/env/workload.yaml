@@ -1,0 +1,4 @@
+model: llama_70b
+num_layers: 96
+nodes_per_domain: 8
+peak_perf_tflops: 120.0
