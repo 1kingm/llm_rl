@@ -216,14 +216,17 @@ class AstraSimEnv(BaseEnv):
 
         # 根据工作负载类型生成不同的工作负载
         if self.config.workload_type == "allreduce":
-            workload_cfg = generate_allreduce_workload(
-                out_dir / "workload",
-                num_npus=total_npus,
-                data_size_bytes=self.config.allreduce_data_size_bytes,
-                num_iterations=self.config.allreduce_iterations,
-                compute_us=self.config.layer_runtime_us,
-                allow_fallback=self.config.allow_et_fallback,
-            )
+            if self.config.use_mock:
+                workload_cfg = out_dir / "workload_mock"
+            else:
+                workload_cfg = generate_allreduce_workload(
+                    out_dir / "workload",
+                    num_npus=total_npus,
+                    data_size_bytes=self.config.allreduce_data_size_bytes,
+                    num_iterations=self.config.allreduce_iterations,
+                    compute_us=self.config.layer_runtime_us,
+                    allow_fallback=self.config.allow_et_fallback,
+                )
             # AllReduce 通信量估算
             from ..utils.astra_adapter import estimate_allreduce_comm_volume_gb
             estimated_comm_gb = estimate_allreduce_comm_volume_gb(
@@ -232,14 +235,17 @@ class AstraSimEnv(BaseEnv):
                 num_iterations=self.config.allreduce_iterations,
             )
         else:
-            workload_cfg = generate_workload_et(
-                out_dir / "workload",
-                placement,
-                num_npus=total_npus,
-                layer_runtime_us=self.config.layer_runtime_us,
-                comm_size_bytes=self.config.comm_size_bytes,
-                allow_fallback=self.config.allow_et_fallback,
-            )
+            if self.config.use_mock:
+                workload_cfg = out_dir / "workload_mock"
+            else:
+                workload_cfg = generate_workload_et(
+                    out_dir / "workload",
+                    placement,
+                    num_npus=total_npus,
+                    layer_runtime_us=self.config.layer_runtime_us,
+                    comm_size_bytes=self.config.comm_size_bytes,
+                    allow_fallback=self.config.allow_et_fallback,
+                )
 
         output_path = Path(self.config.results_path)
         if self.config.use_mock:
