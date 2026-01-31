@@ -254,6 +254,35 @@ def compute_cross_domain_comm(
     return cross_edges, cross_domain_comm_gb
 
 
+def _count_cross_edges(placement: List[int]) -> int:
+    if len(placement) < 2:
+        return 0
+    return sum(1 for i in range(len(placement) - 1) if placement[i] != placement[i + 1])
+
+
+def _balance_score(placement: List[int], num_domains: Optional[int] = None) -> float:
+    if not placement:
+        return 0.0
+    num_layers = len(placement)
+    if num_domains is None:
+        num_domains = max(placement) + 1
+    if num_domains <= 0:
+        return 0.0
+
+    layers_per_domain = [0] * num_domains
+    for domain_id in placement:
+        if 0 <= domain_id < num_domains:
+            layers_per_domain[domain_id] += 1
+
+    mean_layers = num_layers / num_domains
+    if mean_layers <= 0:
+        return 0.0
+    variance = sum((x - mean_layers) ** 2 for x in layers_per_domain) / num_domains
+    std_dev = variance ** 0.5
+    cv = std_dev / mean_layers
+    return max(0.0, 1.0 - cv)
+
+
 class RewardCalculator:
     """奖励计算器.
 
@@ -266,9 +295,11 @@ class RewardCalculator:
         self,
         weights: RewardWeights | None = None,
         baselines: RewardBaselines | None = None,
+        num_domains: Optional[int] = None,
     ) -> None:
         self.weights = weights or RewardWeights()
         self.baselines = baselines or RewardBaselines()
+        self.num_domains = num_domains
 
     def compute(
         self,
@@ -292,7 +323,6 @@ class RewardCalculator:
             1.0, self.baselines.baseline_cycles
         )
 
-        # 利用率奖励: 直接使用利用率（0-1）
         r_util = metrics.utilization
 
         # 通信成本: 优先使用 comm_cycles，其次使用精确计算的跨域通信量
@@ -306,6 +336,15 @@ class RewardCalculator:
         else:
             # 回退到 metrics 中的近似值（可能不准确）
             r_cost = metrics.cross_domain_comm_gb / max(1.0, self.baselines.baseline_comm_gb)
+
+        # 基于放置的奖励修正：鼓励均衡、惩罚过多跨域切分
+        if placement is not None:
+            balance_score = _balance_score(placement, self.num_domains)
+            r_util = metrics.utilization * (0.5 + 0.5 * balance_score)
+            cross_edges = _count_cross_edges(placement)
+            denom = max(1, (self.num_domains or (max(placement) + 1)) - 1)
+            cut_ratio = cross_edges / denom
+            r_cost = r_cost * (1.0 + cut_ratio)
 
         # 总奖励: 效率 + 利用率 - 成本
         reward = (

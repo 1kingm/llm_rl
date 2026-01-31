@@ -55,10 +55,16 @@ def run_rollout(
 
             explanation = None
             if reward_breakdown is not None:
+                weights = None
+                reward_calculator = getattr(env, "reward_calculator", None)
+                if reward_calculator is not None and getattr(reward_calculator, "weights", None) is not None:
+                    w = reward_calculator.weights
+                    weights = {"w_eff": w.w_eff, "w_util": w.w_util, "w_cost": w.w_cost}
                 explanation = build_explanation(
                     placement=action,
                     reward=reward_breakdown,
                     network_state=network_state_used,
+                    weights=weights,
                 )
                 info["explanation"] = explanation
 

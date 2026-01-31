@@ -259,6 +259,7 @@ def build_explanation(
     network_state: Optional[NetworkState] = None,
     avg_inter_bandwidth_gbps: Optional[float] = None,
     avg_inter_latency_ms: Optional[float] = None,
+    weights: Optional[Dict[str, float]] = None,
 ) -> Dict[str, Any]:
     """组装完整的解释载荷.
 
@@ -268,13 +269,14 @@ def build_explanation(
         network_state: 网络状态（可选）
         avg_inter_bandwidth_gbps: 平均域间带宽（兼容旧接口）
         avg_inter_latency_ms: 平均域间延迟（兼容旧接口）
+        weights: 奖励权重 {w_eff, w_util, w_cost}
 
     Returns:
         完整的解释载荷字典
     """
     # 奖励分解
     if reward is not None:
-        reward_summary = summarize_reward(reward)
+        reward_summary = summarize_reward(reward, weights=weights)
     else:
         reward_summary = {
             "r_eff": 0.0, "r_util": 0.0, "r_cost": 0.0, "reward": 0.0,

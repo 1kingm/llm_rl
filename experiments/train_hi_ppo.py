@@ -32,6 +32,7 @@ from src.algorithms.hi_ppo import (
     HiPPOTrainer,
     train_hi_ppo,
 )
+from src.algorithms.reward_functions import RewardWeights
 from src.utils.gnn_encoder import GNNConfig
 
 
@@ -43,11 +44,20 @@ def load_config(config_path: str) -> dict:
 
 def create_configs_from_yaml(yaml_config: dict) -> tuple:
     """从 YAML 配置创建各个配置对象."""
+    reward_cfg = yaml_config.get("reward", {})
+    default_weights = RewardWeights()
+    reward_weights = RewardWeights(
+        w_eff=reward_cfg.get("w_eff", default_weights.w_eff),
+        w_util=reward_cfg.get("w_util", default_weights.w_util),
+        w_cost=reward_cfg.get("w_cost", default_weights.w_cost),
+    )
+
     # 环境配置
     env_cfg = yaml_config.get("env", {})
     env_config = EnvConfig(
         num_domains=env_cfg.get("num_domains", 3),
         num_layers=env_cfg.get("num_layers", 96),
+        episode_length=env_cfg.get("episode_length", EnvConfig().episode_length),
         bandwidth_fluctuation=env_cfg.get("bandwidth_fluctuation", 0.3),
         latency_jitter=env_cfg.get("latency_jitter", 0.2),
         use_mock=env_cfg.get("use_mock", False),
@@ -58,6 +68,7 @@ def create_configs_from_yaml(yaml_config: dict) -> tuple:
         ns3_network_config=env_cfg.get("ns3_network_config", EnvConfig().ns3_network_config),
         ns3_comm_group_config=env_cfg.get("ns3_comm_group_config", EnvConfig().ns3_comm_group_config),
         ns3_logical_topology_dims=env_cfg.get("ns3_logical_topology_dims"),
+        reward_weights=reward_weights,
         seed=yaml_config.get("seed", 42),
     )
 

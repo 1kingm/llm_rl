@@ -385,7 +385,12 @@ class HiPPOTrainer:
         if num_domains <= 1:
             return [0] * num_layers
 
-        cut_points = sorted(cut_points)
+        filtered_cuts: List[int] = []
+        for cut in cut_points:
+            if cut >= num_layers:
+                break
+            filtered_cuts.append(int(cut))
+        cut_points = sorted(filtered_cuts)
         placement = []
         current_domain = 0
         next_cut_idx = 0
@@ -511,10 +516,16 @@ class HiPPOTrainer:
         config = self.trainer_config
 
         # 生成解释
+        weights = None
+        reward_calculator = getattr(self.env, "reward_calculator", None)
+        if reward_calculator is not None and getattr(reward_calculator, "weights", None) is not None:
+            w = reward_calculator.weights
+            weights = {"w_eff": w.w_eff, "w_util": w.w_util, "w_cost": w.w_cost}
         explanation = build_explanation(
             placement=placement,
             reward=reward_breakdown,
             network_state=network_state,
+            weights=weights,
         )
 
         # 更新统计

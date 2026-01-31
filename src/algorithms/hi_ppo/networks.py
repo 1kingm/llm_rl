@@ -92,7 +92,7 @@ class PolicyNetwork(nn.Module):
     """策略网络：输出切分点的动作分布.
 
     对于 K 个域，需要选择 K-1 个切分点。
-    使用自回归方式依次选择每个切分点。
+    使用自回归方式依次选择每个切分点，允许使用 STOP 标记提前结束切分。
     """
 
     def __init__(
@@ -125,9 +125,9 @@ class PolicyNetwork(nn.Module):
 
         # 切分点预测头
         head_input_dim = config.hidden_sizes[-1] + self.cut_embedding_dim * self.num_cuts
-        self.cut_heads = nn.ModuleList([
-            nn.Linear(head_input_dim, num_layers) for _ in range(self.num_cuts)
-        ])
+        self.cut_heads = nn.ModuleList(
+            [nn.Linear(head_input_dim, num_layers + 1) for _ in range(self.num_cuts)]
+        )
 
         # 初始化
         if config.orthogonal_init:
@@ -153,6 +153,7 @@ class PolicyNetwork(nn.Module):
         """
         batch_size = state.shape[0]
         device = state.device
+        stop_idx = self.num_layers
 
         if self.num_cuts == 0:
             empty_actions = torch.zeros(batch_size, 0, dtype=torch.long, device=device)
@@ -171,6 +172,7 @@ class PolicyNetwork(nn.Module):
         entropies = []
 
         prev_cut = torch.zeros(batch_size, dtype=torch.long, device=device)
+        stopped = torch.zeros(batch_size, dtype=torch.bool, device=device)
 
         for i in range(self.num_cuts):
             # 拼接特征和已选切分点 embedding
@@ -178,27 +180,33 @@ class PolicyNetwork(nn.Module):
             head_input = torch.cat([features, cut_embeds_flat], dim=-1)
 
             # 计算 logits
-            logits = self.cut_heads[i](head_input)  # [batch, num_layers]
+            logits = self.cut_heads[i](head_input)  # [batch, num_layers + 1]
 
             # 应用约束 mask：切分点必须递增
             idx = torch.arange(self.num_layers, device=device).unsqueeze(0)  # [1, num_layers]
-            max_cut = self.num_layers - (self.num_cuts - i)  # 保留后续切分点的空间
-            mask = (idx <= prev_cut.unsqueeze(1)) | (idx > max_cut)  # [batch, num_layers]
-            logits = logits.masked_fill(mask, float('-inf'))
+            mask = idx <= prev_cut.unsqueeze(1)  # [batch, num_layers]
+            mask = torch.cat([mask, torch.zeros((batch_size, 1), device=device, dtype=torch.bool)], dim=1)
+            if stopped.any():
+                stop_mask = torch.ones_like(mask)
+                stop_mask[:, stop_idx] = False
+                mask = torch.where(stopped.unsqueeze(1), stop_mask, mask)
+            logits = logits.masked_fill(mask, float("-inf"))
 
             # 采样或确定性选择
             dist = Categorical(logits=logits)
             if deterministic:
-                action = logits.argmax(dim=-1)
+                action = torch.where(stopped, torch.full_like(prev_cut, stop_idx), logits.argmax(dim=-1))
             else:
-                action = dist.sample()
+                action = torch.where(stopped, torch.full_like(prev_cut, stop_idx), dist.sample())
+
+            stopped = stopped | (action == stop_idx)
 
             # 更新已选切分点
             updated_cuts = selected_cuts.clone()
             updated_cuts[:, i] = action
             selected_cuts = updated_cuts
             cut_embeds = self.cut_embedding(selected_cuts)
-            prev_cut = action
+            prev_cut = torch.where(action == stop_idx, prev_cut, action)
 
             actions.append(action)
             log_probs.append(dist.log_prob(action))
@@ -227,6 +235,7 @@ class PolicyNetwork(nn.Module):
         """
         batch_size = state.shape[0]
         device = state.device
+        stop_idx = self.num_layers
 
         if self.num_cuts == 0:
             zeros = torch.zeros(batch_size, device=device)
@@ -240,6 +249,7 @@ class PolicyNetwork(nn.Module):
         log_probs = []
         entropies = []
         prev_cut = torch.zeros(batch_size, dtype=torch.long, device=device)
+        stopped = torch.zeros(batch_size, dtype=torch.bool, device=device)
 
         for i in range(self.num_cuts):
             cut_embeds_flat = cut_embeds.view(batch_size, -1)
@@ -248,18 +258,27 @@ class PolicyNetwork(nn.Module):
 
             # 约束 mask
             idx = torch.arange(self.num_layers, device=device).unsqueeze(0)
-            max_cut = self.num_layers - (self.num_cuts - i)
-            mask = (idx <= prev_cut.unsqueeze(1)) | (idx > max_cut)
-            logits = logits.masked_fill(mask, float('-inf'))
+            mask = idx <= prev_cut.unsqueeze(1)
+            mask = torch.cat([mask, torch.zeros((batch_size, 1), device=device, dtype=torch.bool)], dim=1)
+            if stopped.any():
+                stop_mask = torch.ones_like(mask)
+                stop_mask[:, stop_idx] = False
+                mask = torch.where(stopped.unsqueeze(1), stop_mask, mask)
+            logits = logits.masked_fill(mask, float("-inf"))
 
             dist = Categorical(logits=logits)
-            action = actions[:, i]
+            action = torch.where(
+                stopped,
+                torch.full_like(actions[:, i], stop_idx),
+                actions[:, i],
+            )
 
             updated_cuts = selected_cuts.clone()
             updated_cuts[:, i] = action
             selected_cuts = updated_cuts
             cut_embeds = self.cut_embedding(selected_cuts)
-            prev_cut = action
+            prev_cut = torch.where(action == stop_idx, prev_cut, action)
+            stopped = stopped | (action == stop_idx)
 
             log_probs.append(dist.log_prob(action))
             entropies.append(dist.entropy())

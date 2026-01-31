@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import csv
 from pathlib import Path
 import random
@@ -44,6 +44,7 @@ from ..utils.types import NetworkState, RunMetrics
 class EnvConfig:
     num_domains: int = 3
     num_layers: int = 96
+    episode_length: int = 128
     nodes_per_domain: int = 8
     topology: str = "ring"
     out_dir: str = "configs/generated"
@@ -57,6 +58,7 @@ class EnvConfig:
     ns3_comm_group_config: str = "empty"
     ns3_logical_topology_dims: Optional[List[int]] = None
     remote_mem_config: str = "astra-sim/examples/remote_memory/analytical/no_memory_expansion.json"
+    reward_weights: RewardWeights = field(default_factory=RewardWeights)
     peak_perf_tflops: float = 120.0
     local_mem_bw_gbps: float = 1600.0
     layer_runtime_us: int = 100
@@ -118,6 +120,7 @@ class AstraSimEnv(BaseEnv):
     def __init__(self, config: EnvConfig | None = None) -> None:
         self.config = config or EnvConfig()
         self._rng = random.Random(self.config.seed)
+        self._episode_step = 0
 
         self.network = NetworkDynamics(
             num_domains=self.config.num_domains,
@@ -148,9 +151,11 @@ class AstraSimEnv(BaseEnv):
                 baseline_comm_cycles=self.config.baseline_comm_cycles,
             )
 
+        reward_weights = self.config.reward_weights or RewardWeights()
         self.reward_calculator = RewardCalculator(
-            weights=RewardWeights(),
+            weights=reward_weights,
             baselines=baselines,
+            num_domains=self.config.num_domains,
         )
         self.current_network_state: Optional[NetworkState] = None
         self._last_domain_loads: List[float] = self._default_domain_loads()
@@ -169,6 +174,7 @@ class AstraSimEnv(BaseEnv):
         self.current_network_state = self.network.sample_state()
         self._last_domain_loads = self._default_domain_loads()
         self._last_placement = None
+        self._episode_step = 0
         observation = self._build_observation(self.current_network_state, self._last_domain_loads)
         return observation, {}
 
@@ -322,7 +328,12 @@ class AstraSimEnv(BaseEnv):
             "cross_edges": cross_edges,
             "cross_domain_comm_gb": cross_domain_comm_gb,
         }
-        return observation, reward_breakdown.reward, False, False, info
+        self._episode_step += 1
+        terminated = False
+        truncated = False
+        if self.config.episode_length > 0 and self._episode_step >= self.config.episode_length:
+            truncated = True
+        return observation, reward_breakdown.reward, terminated, truncated, info
 
     def sample_random_action(self) -> List[int]:
         return [self._rng.randrange(self.config.num_domains) for _ in range(self.config.num_layers)]
