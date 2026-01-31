@@ -194,7 +194,9 @@ class PolicyNetwork(nn.Module):
                 action = dist.sample()
 
             # 更新已选切分点
-            selected_cuts[:, i] = action
+            updated_cuts = selected_cuts.clone()
+            updated_cuts[:, i] = action
+            selected_cuts = updated_cuts
             cut_embeds = self.cut_embedding(selected_cuts)
             prev_cut = action
 
@@ -253,7 +255,9 @@ class PolicyNetwork(nn.Module):
             dist = Categorical(logits=logits)
             action = actions[:, i]
 
-            selected_cuts[:, i] = action
+            updated_cuts = selected_cuts.clone()
+            updated_cuts[:, i] = action
+            selected_cuts = updated_cuts
             cut_embeds = self.cut_embedding(selected_cuts)
             prev_cut = action
 
