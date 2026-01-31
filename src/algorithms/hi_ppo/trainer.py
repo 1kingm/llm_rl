@@ -10,9 +10,11 @@
 
 from __future__ import annotations
 
+import contextlib
 import json
 import time
-from dataclasses import dataclass, field, asdict
+from datetime import datetime
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Dict, List, Optional
 
@@ -23,9 +25,14 @@ try:
 except ImportError:
     torch = None
 
+try:
+    from tqdm import tqdm
+except ImportError:  # pragma: no cover - optional dependency
+    tqdm = None
+
 from ...envs.astra_env import AstraSimEnv, EnvConfig
 from ...utils.explainability import build_explanation
-from ...utils.gnn_encoder import GNNEncoder, GNNConfig, TopologyGraph
+from ...utils.gnn_encoder import GNNEncoder, GNNConfig
 from .ppo_agent import PPOAgent, PPOConfig
 from .networks import NetworkConfig
 
@@ -40,6 +47,7 @@ class TrainerConfig:
     eval_interval: int = 50_000  # 评估间隔
     save_interval: int = 100_000  # 保存间隔
     log_interval: int = 1000  # 日志间隔
+    live_log_path: str = "results/training/train_live.log"  # 实时日志路径
 
     # 路径
     log_dir: str = "results/training"
@@ -48,6 +56,10 @@ class TrainerConfig:
     # 可解释性
     enable_explainability: bool = True  # 是否启用可解释性记录
     explanation_log_interval: int = 100  # 解释记录间隔（步数）
+    explainability_history_size: int = 10_000  # 可解释性历史保留长度（0=不限制）
+
+    # GNN 训练
+    train_gnn: bool = False  # 是否在 PPO 更新中联合训练 GNN 编码器
 
     # 其他
     seed: int = 42
@@ -98,8 +110,13 @@ class HiPPOTrainer:
         # 设置随机种子
         self._set_seed(trainer_config.seed)
 
-        # 设备
-        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        # 设备：优先 CUDA，其次 MPS（macOS），否则 CPU
+        if torch.cuda.is_available():
+            self.device = torch.device("cuda")
+        elif getattr(torch.backends, "mps", None) is not None and torch.backends.mps.is_available():
+            self.device = torch.device("mps")
+        else:
+            self.device = torch.device("cpu")
 
         # 创建环境
         self.env = AstraSimEnv(env_config)
@@ -112,6 +129,12 @@ class HiPPOTrainer:
         # 更新网络配置
         self.network_config.state_dim = total_state_dim
 
+        # 创建 GNN 编码器
+        self.gnn_encoder = GNNEncoder(self.gnn_config).to(str(self.device))
+        train_gnn = bool(trainer_config.train_gnn and self.gnn_encoder.has_model())
+        if trainer_config.train_gnn and not train_gnn and trainer_config.verbose >= 1:
+            print("GNN 训练已请求，但当前环境不可用（缺少 PyG 或未启用 GNN）。", flush=True)
+
         # 创建 PPO Agent
         self.agent = PPOAgent(
             config=ppo_config,
@@ -119,13 +142,15 @@ class HiPPOTrainer:
             num_layers=env_config.num_layers,
             num_domains=env_config.num_domains,
             device=self.device,
+            buffer_size=trainer_config.steps_per_rollout,
+            gnn_encoder=self.gnn_encoder,
+            gnn_out_dim=self.gnn_config.out_dim,
+            train_gnn=train_gnn,
         )
-
-        # 创建 GNN 编码器
-        self.gnn_encoder = GNNEncoder(self.gnn_config)
 
         # 训练统计
         self.stats = TrainingStats()
+        self._live_log_file: Optional[object] = None
 
         # 可解释性追踪
         self._cross_cuts_history: List[int] = []
@@ -184,107 +209,173 @@ class HiPPOTrainer:
         episode_length = 0
 
         if config.verbose >= 1:
-            print(f"开始训练: 总步数={config.total_timesteps}, 设备={self.device}")
-            print(f"环境: {self.env_config.num_domains}域, {self.env_config.num_layers}层")
+            print(f"开始训练: 总步数={config.total_timesteps}, 设备={self.device}", flush=True)
+            print(f"环境: {self.env_config.num_domains}域, {self.env_config.num_layers}层", flush=True)
 
-        while self.stats.timesteps < config.total_timesteps:
-            # 收集 rollout
-            for _ in range(config.steps_per_rollout):
-                # 选择动作
-                action, log_prob, value = self.agent.select_action(state)
+        pbar = None
+        with contextlib.ExitStack() as stack:
+            if config.verbose >= 1 and config.live_log_path:
+                live_log_path = Path(config.live_log_path)
+                live_log_path.parent.mkdir(parents=True, exist_ok=True)
+                self._live_log_file = stack.enter_context(
+                    open(live_log_path, "a", encoding="utf-8", buffering=1)
+                )
+                self._write_live_log(
+                    f"[start] ts={datetime.now().isoformat(timespec='seconds')} "
+                    f"timesteps={config.total_timesteps}, device={self.device}, "
+                    f"domains={self.env_config.num_domains}, layers={self.env_config.num_layers}"
+                )
 
-                # 将切分点转换为放置向量
-                placement = self._cut_points_to_placement(action.tolist())
+            if config.verbose >= 1 and tqdm is not None:
+                pbar = tqdm(total=config.total_timesteps, desc="Hi-PPO Training", unit="step")
+                if self.stats.timesteps:
+                    pbar.update(self.stats.timesteps)
+                stack.callback(pbar.close)
 
-                # 执行动作
-                next_obs, reward, terminated, truncated, info = self.env.step(placement)
-                done = terminated or truncated
+            try:
+                while self.stats.timesteps < config.total_timesteps:
+                    # 收集 rollout
+                    for _ in range(config.steps_per_rollout):
+                        step_id = self.stats.timesteps + 1
+                        if config.verbose >= 2 and config.log_interval > 0 and step_id % config.log_interval == 0:
+                            print(f"[Step {step_id}] started", flush=True)
+                            self._write_live_log(f"[Step {step_id}] started")
+                        # 选择动作
+                        action, log_prob, value = self.agent.select_action(state)
 
-                # 生成可解释性记录
-                if config.enable_explainability:
-                    self._record_explanation(
-                        placement=placement,
-                        reward_breakdown=info.get("reward_breakdown"),
-                        network_state=info.get("network_state", self.env.current_network_state),
+                        # 将切分点转换为放置向量
+                        placement = self._cut_points_to_placement(action.tolist())
+
+                        # 执行动作
+                        next_obs, reward, terminated, truncated, info = self.env.step(placement)
+                        done = terminated or truncated
+
+                        # 生成可解释性记录
+                        if config.enable_explainability:
+                            self._record_explanation(
+                                placement=placement,
+                                reward_breakdown=info.get("reward_breakdown"),
+                                network_state=info.get("network_state", self.env.current_network_state),
+                            )
+
+                        # 存储转移
+                        self.agent.store_transition(
+                            state,
+                            action,
+                            reward,
+                            done,
+                            value,
+                            log_prob,
+                            network_state=info.get("network_state", self.env.current_network_state),
+                            domain_loads=info.get("domain_loads"),
+                        )
+
+                        # 更新状态
+                        state = self._augment_state(next_obs, self.env.current_network_state)
+                        episode_reward += reward
+                        episode_length += 1
+                        self.stats.timesteps += 1
+                        if pbar is not None:
+                            pbar.update(1)
+
+                        # Episode 结束
+                        if done:
+                            self.stats.episodes += 1
+                            self.stats.episode_rewards.append(episode_reward)
+                            self.stats.episode_lengths.append(episode_length)
+                            self.stats.total_reward += episode_reward
+
+                            if config.verbose >= 2:
+                                print(
+                                    f"Episode {self.stats.episodes}: reward={episode_reward:.4f}, length={episode_length}",
+                                    flush=True,
+                                )
+
+                            # 重置
+                            obs, _ = self.env.reset()
+                            state = self._augment_state(obs, self.env.current_network_state)
+                            episode_reward = 0.0
+                            episode_length = 0
+
+                        # 检查是否达到总步数
+                        if self.stats.timesteps >= config.total_timesteps:
+                            break
+
+                    # 计算 GAE
+                    self.agent.compute_returns(state, done)
+
+                    # PPO 更新
+                    self.agent.set_training_progress(self.stats.timesteps, config.total_timesteps)
+                    update_stats = self.agent.update()
+                    self.stats.updates += 1
+                    self.stats.update_stats.append(update_stats)
+
+                    # 日志
+                    if self.stats.timesteps % config.log_interval < config.steps_per_rollout:
+                        self._log_progress(update_stats)
+
+                    # 评估
+                    if self.stats.timesteps % config.eval_interval < config.steps_per_rollout:
+                        eval_reward = self._evaluate()
+                        self.stats.eval_rewards.append(eval_reward)
+                        if config.verbose >= 1:
+                            print(f"[Eval] timesteps={self.stats.timesteps}, reward={eval_reward:.4f}", flush=True)
+                            self._write_live_log(
+                                f"[Eval] timesteps={self.stats.timesteps}, reward={eval_reward:.4f}"
+                            )
+
+                    # 保存
+                    if self.stats.timesteps % config.save_interval < config.steps_per_rollout:
+                        self._save_checkpoint()
+
+                    # 回调
+                    if callback is not None and not callback(self.stats):
+                        if config.verbose >= 1:
+                            print("训练被回调函数终止", flush=True)
+                            self._write_live_log("[stop] callback requested stop")
+                        break
+
+                    if pbar is not None:
+                        pbar.set_postfix(
+                            {
+                                "updates": self.stats.updates,
+                                "episodes": self.stats.episodes,
+                            }
+                        )
+
+                # 训练结束
+                self.stats.wall_time = time.time() - start_time
+                self._finalize_explainability_stats()
+                self._save_checkpoint(final=True)
+                self._save_stats()
+
+                if self._live_log_file is not None:
+                    self._write_live_log(
+                        f"[done] timesteps={self.stats.timesteps}, wall_time={self.stats.wall_time:.2f}s"
                     )
 
-                # 存储转移
-                self.agent.store_transition(state, action, reward, done, value, log_prob)
-
-                # 更新状态
-                state = self._augment_state(next_obs, self.env.current_network_state)
-                episode_reward += reward
-                episode_length += 1
-                self.stats.timesteps += 1
-
-                # Episode 结束
-                if done:
-                    self.stats.episodes += 1
-                    self.stats.episode_rewards.append(episode_reward)
-                    self.stats.episode_lengths.append(episode_length)
-                    self.stats.total_reward += episode_reward
-
-                    if config.verbose >= 2:
-                        print(f"Episode {self.stats.episodes}: reward={episode_reward:.4f}, length={episode_length}")
-
-                    # 重置
-                    obs, _ = self.env.reset()
-                    state = self._augment_state(obs, self.env.current_network_state)
-                    episode_reward = 0.0
-                    episode_length = 0
-
-                # 检查是否达到总步数
-                if self.stats.timesteps >= config.total_timesteps:
-                    break
-
-            # 计算 GAE
-            self.agent.compute_returns(state, done)
-
-            # PPO 更新
-            self.agent.set_training_progress(self.stats.timesteps, config.total_timesteps)
-            update_stats = self.agent.update()
-            self.stats.updates += 1
-            self.stats.update_stats.append(update_stats)
-
-            # 日志
-            if self.stats.timesteps % config.log_interval < config.steps_per_rollout:
-                self._log_progress(update_stats)
-
-            # 评估
-            if self.stats.timesteps % config.eval_interval < config.steps_per_rollout:
-                eval_reward = self._evaluate()
-                self.stats.eval_rewards.append(eval_reward)
                 if config.verbose >= 1:
-                    print(f"[Eval] timesteps={self.stats.timesteps}, reward={eval_reward:.4f}")
+                    print(f"训练完成: 总步数={self.stats.timesteps}, 耗时={self.stats.wall_time:.2f}s", flush=True)
+                    if self.stats.episode_rewards:
+                        print(f"平均奖励={np.mean(self.stats.episode_rewards[-100:]):.4f}", flush=True)
+                    else:
+                        print("平均奖励=N/A (无完整 episode)", flush=True)
 
-            # 保存
-            if self.stats.timesteps % config.save_interval < config.steps_per_rollout:
-                self._save_checkpoint()
+                    # 可解释性摘要
+                    if config.enable_explainability:
+                        print("\n[可解释性摘要]", flush=True)
+                        print(f"  平均跨域切分: {self.stats.avg_cross_cuts:.2f}", flush=True)
+                        print(f"  平均均衡得分: {self.stats.avg_balance_score:.2f}", flush=True)
+                        print(f"  主导因素分布: {self.stats.dominant_factors}", flush=True)
 
-            # 回调
-            if callback is not None and not callback(self.stats):
-                if config.verbose >= 1:
-                    print("训练被回调函数终止")
-                break
+                return self.stats
+            finally:
+                self._live_log_file = None
 
-        # 训练结束
-        self.stats.wall_time = time.time() - start_time
-        self._finalize_explainability_stats()
-        self._save_checkpoint(final=True)
-        self._save_stats()
-
-        if config.verbose >= 1:
-            print(f"训练完成: 总步数={self.stats.timesteps}, 耗时={self.stats.wall_time:.2f}s")
-            print(f"平均奖励={np.mean(self.stats.episode_rewards[-100:]):.4f}")
-
-            # 可解释性摘要
-            if config.enable_explainability:
-                print("\n[可解释性摘要]")
-                print(f"  平均跨域切分: {self.stats.avg_cross_cuts:.2f}")
-                print(f"  平均均衡得分: {self.stats.avg_balance_score:.2f}")
-                print(f"  主导因素分布: {self.stats.dominant_factors}")
-
-        return self.stats
+    def _write_live_log(self, message: str) -> None:
+        """写入实时日志文件（若启用）."""
+        if self._live_log_file is not None:
+            self._live_log_file.write(message + "\n")
 
     def _cut_points_to_placement(self, cut_points: List[int]) -> List[int]:
         """将切分点转换为放置向量."""
@@ -433,6 +524,12 @@ class HiPPOTrainer:
 
         self._cross_cuts_history.append(cross_cuts)
         self._balance_scores_history.append(balance_score)
+        max_hist = int(config.explainability_history_size)
+        if max_hist > 0:
+            if len(self._cross_cuts_history) > max_hist:
+                self._cross_cuts_history = self._cross_cuts_history[-max_hist:]
+            if len(self._balance_scores_history) > max_hist:
+                self._balance_scores_history = self._balance_scores_history[-max_hist:]
 
         # 更新主导因素统计
         reward_info = explanation.get("reward_breakdown", {})

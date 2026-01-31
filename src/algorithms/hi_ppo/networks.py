@@ -20,7 +20,7 @@ class NetworkConfig:
     """网络配置."""
 
     state_dim: int = 128  # 状态维度
-    hidden_sizes: List[int] = None  # 隐藏层大小
+    hidden_sizes: Optional[List[int]] = None  # 隐藏层大小
     activation: str = "tanh"  # 激活函数: tanh, relu, gelu
     layer_norm: bool = True  # 是否使用 LayerNorm
     dropout: float = 0.1  # Dropout 比例
@@ -154,6 +154,11 @@ class PolicyNetwork(nn.Module):
         batch_size = state.shape[0]
         device = state.device
 
+        if self.num_cuts == 0:
+            empty_actions = torch.zeros(batch_size, 0, dtype=torch.long, device=device)
+            zeros = torch.zeros(batch_size, device=device)
+            return empty_actions, zeros, zeros
+
         # 提取特征
         features = self.feature_extractor(state)  # [batch, hidden]
 
@@ -176,8 +181,9 @@ class PolicyNetwork(nn.Module):
             logits = self.cut_heads[i](head_input)  # [batch, num_layers]
 
             # 应用约束 mask：切分点必须递增
-            mask = torch.arange(self.num_layers, device=device).unsqueeze(0)  # [1, num_layers]
-            mask = mask <= prev_cut.unsqueeze(1)  # [batch, num_layers]
+            idx = torch.arange(self.num_layers, device=device).unsqueeze(0)  # [1, num_layers]
+            max_cut = self.num_layers - (self.num_cuts - i)  # 保留后续切分点的空间
+            mask = (idx <= prev_cut.unsqueeze(1)) | (idx > max_cut)  # [batch, num_layers]
             logits = logits.masked_fill(mask, float('-inf'))
 
             # 采样或确定性选择
@@ -220,6 +226,10 @@ class PolicyNetwork(nn.Module):
         batch_size = state.shape[0]
         device = state.device
 
+        if self.num_cuts == 0:
+            zeros = torch.zeros(batch_size, device=device)
+            return zeros, zeros
+
         features = self.feature_extractor(state)
 
         selected_cuts = torch.zeros(batch_size, self.num_cuts, dtype=torch.long, device=device)
@@ -235,8 +245,9 @@ class PolicyNetwork(nn.Module):
             logits = self.cut_heads[i](head_input)
 
             # 约束 mask
-            mask = torch.arange(self.num_layers, device=device).unsqueeze(0)
-            mask = mask <= prev_cut.unsqueeze(1)
+            idx = torch.arange(self.num_layers, device=device).unsqueeze(0)
+            max_cut = self.num_layers - (self.num_cuts - i)
+            mask = (idx <= prev_cut.unsqueeze(1)) | (idx > max_cut)
             logits = logits.masked_fill(mask, float('-inf'))
 
             dist = Categorical(logits=logits)

@@ -11,6 +11,8 @@ from typing import Generator, List, Optional, Tuple
 import numpy as np
 import torch
 
+from ...utils.types import NetworkState
+
 
 @dataclass
 class BufferConfig:
@@ -20,6 +22,7 @@ class BufferConfig:
     gamma: float = 0.99  # 折扣因子
     gae_lambda: float = 0.95  # GAE lambda
     normalize_advantages: bool = True  # 是否标准化优势
+    advantage_eps: float = 1e-8  # 优势标准化稳定项
 
 
 @dataclass
@@ -46,6 +49,10 @@ class RolloutBuffer:
     advantages: np.ndarray = field(init=False)
     returns: np.ndarray = field(init=False)
 
+    # 额外信息（可选）
+    network_states: List[Optional[NetworkState]] = field(init=False)
+    domain_loads: List[Optional[List[float]]] = field(init=False)
+
     # 指针
     ptr: int = field(init=False, default=0)
     full: bool = field(init=False, default=False)
@@ -64,6 +71,8 @@ class RolloutBuffer:
         self.log_probs = np.zeros(size, dtype=np.float32)
         self.advantages = np.zeros(size, dtype=np.float32)
         self.returns = np.zeros(size, dtype=np.float32)
+        self.network_states = [None] * size
+        self.domain_loads = [None] * size
         self.ptr = 0
         self.full = False
 
@@ -75,6 +84,8 @@ class RolloutBuffer:
         done: bool,
         value: float,
         log_prob: float,
+        network_state: Optional[NetworkState] = None,
+        domain_loads: Optional[List[float]] = None,
     ) -> None:
         """添加一条经验.
 
@@ -86,12 +97,19 @@ class RolloutBuffer:
             value: 价值估计
             log_prob: 动作对数概率
         """
+        if self.ptr >= self.config.buffer_size:
+            raise RuntimeError(
+                "RolloutBuffer is full. Call reset() or increase buffer_size "
+                "to match steps_per_rollout."
+            )
         self.states[self.ptr] = state
         self.actions[self.ptr] = action
         self.rewards[self.ptr] = reward
         self.dones[self.ptr] = float(done)
         self.values[self.ptr] = value
         self.log_probs[self.ptr] = log_prob
+        self.network_states[self.ptr] = network_state
+        self.domain_loads[self.ptr] = domain_loads
 
         self.ptr += 1
         if self.ptr >= self.config.buffer_size:
@@ -135,7 +153,7 @@ class RolloutBuffer:
         # 标准化优势
         if self.config.normalize_advantages:
             adv = self.advantages[:size]
-            self.advantages[:size] = (adv - adv.mean()) / (adv.std() + 1e-8)
+            self.advantages[:size] = (adv - adv.mean()) / (adv.std() + self.config.advantage_eps)
 
     def get_batches(
         self,
@@ -168,6 +186,8 @@ class RolloutBuffer:
                 "advantages": torch.tensor(self.advantages[batch_indices], device=self.device),
                 "returns": torch.tensor(self.returns[batch_indices], device=self.device),
                 "old_values": torch.tensor(self.values[batch_indices], device=self.device),
+                "network_states": [self.network_states[i] for i in batch_indices],
+                "domain_loads": [self.domain_loads[i] for i in batch_indices],
             }
 
     def get_all(self) -> dict:
@@ -180,6 +200,8 @@ class RolloutBuffer:
             "advantages": torch.tensor(self.advantages[:size], device=self.device),
             "returns": torch.tensor(self.returns[:size], device=self.device),
             "old_values": torch.tensor(self.values[:size], device=self.device),
+            "network_states": self.network_states[:size],
+            "domain_loads": self.domain_loads[:size],
         }
 
     @property

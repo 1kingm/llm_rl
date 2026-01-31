@@ -384,6 +384,10 @@ class GNNEncoder:
         edge_dim = 2  # 边特征维度: [带宽, 延迟]
 
         model_type = self.config.model_type.lower()
+        if model_type in {"graphsage", "gcn"} and self.config.use_edge_features:
+            logger.warning(
+                "%s 不支持 edge features，将忽略 edge features 配置。", self.config.model_type
+            )
         if model_type == "graphsage":
             self._model = GraphSAGEModel(self.config, in_channels, edge_dim)
         elif model_type == "gat":
@@ -398,12 +402,44 @@ class GNNEncoder:
         self._use_gnn = True
         logger.info(f"GNN 编码器初始化完成: {self.config.model_type}")
 
+    def has_model(self) -> bool:
+        """是否具备可训练的 GNN 模型."""
+        return self._use_gnn and self._model is not None
+
     def to(self, device: str) -> "GNNEncoder":
         """将模型移动到指定设备."""
         self._device = device
         if self._model is not None:
             self._model = self._model.to(device)
         return self
+
+    def train(self) -> None:
+        """切换到训练模式."""
+        if self._model is not None:
+            self._model.train()
+
+    def eval(self) -> None:
+        """切换到评估模式."""
+        if self._model is not None:
+            self._model.eval()
+
+    def parameters(self):
+        """获取模型参数（用于优化器注册）。"""
+        if self._model is None:
+            return []
+        return self._model.parameters()
+
+    def state_dict(self) -> Optional[Dict[str, Any]]:
+        """获取模型权重."""
+        if self._model is None:
+            return None
+        return self._model.state_dict()
+
+    def load_state_dict(self, state_dict: Optional[Dict[str, Any]]) -> None:
+        """加载模型权重."""
+        if self._model is None or state_dict is None:
+            return
+        self._model.load_state_dict(state_dict)
 
     def encode(self, graph: TopologyGraph) -> List[float]:
         """将拓扑图编码为固定长度向量.
@@ -418,8 +454,22 @@ class GNNEncoder:
             return self._gnn_encode(graph)
         return self._statistical_encode(graph)
 
+    def encode_tensor(self, graph: TopologyGraph, with_grad: bool = False) -> torch.Tensor:
+        """返回 torch.Tensor 形式的编码（可选保留梯度）."""
+        if torch is None:
+            raise RuntimeError("PyTorch 不可用，无法返回 tensor 编码。")
+        if self._use_gnn and self._model is not None:
+            return self._gnn_encode_tensor(graph, with_grad=with_grad)
+        stats = self._statistical_encode(graph)
+        return torch.tensor(stats, dtype=torch.float32, device=self._device)
+
     def _gnn_encode(self, graph: TopologyGraph) -> List[float]:
         """使用 GNN 模型编码."""
+        h = self._gnn_encode_tensor(graph, with_grad=False)
+        return h.cpu().tolist()
+
+    def _gnn_encode_tensor(self, graph: TopologyGraph, with_grad: bool = False) -> torch.Tensor:
+        """使用 GNN 模型编码（tensor 输出）."""
         # 转换为 PyTorch Geometric Data 对象
         x = torch.tensor(graph.node_features, dtype=torch.float32, device=self._device)
         edge_index = torch.tensor(graph.edge_index, dtype=torch.long, device=self._device)
@@ -431,10 +481,13 @@ class GNNEncoder:
             )
 
         # 前向传播
-        with torch.no_grad():
+        if with_grad:
             h = self._model(x, edge_index, edge_attr=edge_attr)
+        else:
+            with torch.no_grad():
+                h = self._model(x, edge_index, edge_attr=edge_attr)
 
-        return h.squeeze(0).cpu().tolist()
+        return h.squeeze(0)
 
     def encode_from_network_state(
         self,
@@ -458,6 +511,20 @@ class GNNEncoder:
             network_state, domain_loads, mem_utils, queue_lengths
         )
         return self.encode(graph)
+
+    def encode_tensor_from_network_state(
+        self,
+        network_state: NetworkState,
+        domain_loads: Optional[List[float]] = None,
+        mem_utils: Optional[List[float]] = None,
+        queue_lengths: Optional[List[float]] = None,
+        with_grad: bool = False,
+    ) -> torch.Tensor:
+        """便捷方法：直接从 NetworkState 返回 tensor 编码."""
+        graph = TopologyGraph.from_network_state(
+            network_state, domain_loads, mem_utils, queue_lengths
+        )
+        return self.encode_tensor(graph, with_grad=with_grad)
 
     def _statistical_encode(self, graph: TopologyGraph) -> List[float]:
         """统计特征编码（回退方案）.

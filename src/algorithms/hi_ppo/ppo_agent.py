@@ -19,6 +19,8 @@ import torch.optim as optim
 
 from .networks import ActorCritic, NetworkConfig
 from .buffer import BufferConfig, RolloutBuffer
+from ...utils.gnn_encoder import GNNEncoder
+from ...utils.types import NetworkState
 
 
 @dataclass
@@ -40,6 +42,7 @@ class PPOConfig:
     update_epochs: int = 10  # 每次更新的 epoch 数
     minibatch_size: int = 256  # 小批量大小
     target_kl: Optional[float] = 0.02  # KL 散度阈值（用于早停）
+    adam_eps: float = 1e-5  # Adam epsilon
 
     # GAE 参数
     gamma: float = 0.99
@@ -60,12 +63,30 @@ class PPOAgent:
         num_layers: int,
         num_domains: int,
         device: torch.device = None,
+        buffer_size: Optional[int] = None,
+        gnn_encoder: Optional[GNNEncoder] = None,
+        gnn_out_dim: int = 0,
+        train_gnn: bool = False,
     ) -> None:
         self.config = config
         self.network_config = network_config
         self.num_layers = num_layers
         self.num_domains = num_domains
         self.device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.gnn_encoder = gnn_encoder
+        self.gnn_out_dim = max(0, int(gnn_out_dim))
+        self.base_state_dim = (
+            self.network_config.state_dim - self.gnn_out_dim
+            if self.gnn_out_dim
+            else self.network_config.state_dim
+        )
+        if self.base_state_dim < 0:
+            raise ValueError("gnn_out_dim must be <= state_dim")
+        self.gnn_trainable = bool(
+            train_gnn
+            and self.gnn_encoder is not None
+            and getattr(self.gnn_encoder, "has_model", lambda: False)()
+        )
 
         # 创建 Actor-Critic 网络
         self.actor_critic = ActorCritic(
@@ -75,10 +96,13 @@ class PPOAgent:
         ).to(self.device)
 
         # 优化器
+        params = list(self.actor_critic.parameters())
+        if self.gnn_trainable and self.gnn_encoder is not None:
+            params.extend(list(self.gnn_encoder.parameters()))
         self.optimizer = optim.Adam(
-            self.actor_critic.parameters(),
+            params,
             lr=config.lr,
-            eps=1e-5,
+            eps=config.adam_eps,
         )
 
         # 学习率调度器
@@ -87,7 +111,10 @@ class PPOAgent:
         self._current_progress = 0.0
 
         # 创建缓冲区
+        if buffer_size is None:
+            buffer_size = BufferConfig().buffer_size
         buffer_config = BufferConfig(
+            buffer_size=buffer_size,
             gamma=config.gamma,
             gae_lambda=config.gae_lambda,
             normalize_advantages=config.normalize_advantages,
@@ -142,9 +169,11 @@ class PPOAgent:
         done: bool,
         value: float,
         log_prob: float,
+        network_state: Optional[NetworkState] = None,
+        domain_loads: Optional[List[float]] = None,
     ) -> None:
         """存储转移."""
-        self.buffer.add(state, action, reward, done, value, log_prob)
+        self.buffer.add(state, action, reward, done, value, log_prob, network_state, domain_loads)
 
     def compute_returns(self, last_state: np.ndarray, last_done: bool) -> None:
         """计算 GAE 和 returns.
@@ -166,6 +195,7 @@ class PPOAgent:
             训练统计信息
         """
         config = self.config
+        num_batches = max(1, (self.buffer.size + config.minibatch_size - 1) // config.minibatch_size)
 
         # 重置统计
         policy_losses = []
@@ -173,6 +203,9 @@ class PPOAgent:
         entropies = []
         kl_divs = []
         clip_fractions = []
+
+        if self.gnn_trainable and self.gnn_encoder is not None:
+            self.gnn_encoder.train()
 
         for epoch in range(config.update_epochs):
             for batch in self.buffer.get_batches(config.minibatch_size, shuffle=True):
@@ -182,6 +215,8 @@ class PPOAgent:
                 advantages = batch["advantages"]
                 returns = batch["returns"]
                 old_values = batch["old_values"]
+                if self.gnn_trainable and self.gnn_encoder is not None:
+                    states = self._recompute_states_with_gnn(states, batch)
 
                 # 评估当前策略
                 log_probs, entropy, values = self.actor_critic.evaluate_actions(states, actions)
@@ -239,7 +274,7 @@ class PPOAgent:
 
             # 早停检查
             if config.target_kl is not None:
-                mean_kl = np.mean(kl_divs[-len(list(self.buffer.get_batches(config.minibatch_size))):])
+                mean_kl = np.mean(kl_divs[-num_batches:])
                 if mean_kl > config.target_kl:
                     break
 
@@ -248,6 +283,9 @@ class PPOAgent:
 
         # 重置缓冲区
         self.buffer.reset()
+
+        if self.gnn_trainable and self.gnn_encoder is not None:
+            self.gnn_encoder.eval()
 
         # 返回统计
         stats = {
@@ -265,6 +303,37 @@ class PPOAgent:
 
         return stats
 
+    def _recompute_states_with_gnn(self, states: torch.Tensor, batch: dict) -> torch.Tensor:
+        """使用可训练 GNN 重新计算状态中的拓扑特征."""
+        network_states = batch.get("network_states")
+        if not network_states or self.gnn_out_dim <= 0:
+            return states
+        base_states = states[:, : self.base_state_dim]
+        gnn_features: List[torch.Tensor] = []
+        domain_loads = batch.get("domain_loads")
+        for idx, network_state in enumerate(network_states):
+            if network_state is None:
+                gnn_features.append(torch.zeros(self.gnn_out_dim, device=states.device))
+                continue
+            loads = None
+            if domain_loads is not None and idx < len(domain_loads):
+                loads = domain_loads[idx]
+            gnn_feat = self.gnn_encoder.encode_tensor_from_network_state(
+                network_state,
+                domain_loads=loads,
+                with_grad=True,
+            )
+            if gnn_feat.numel() != self.gnn_out_dim:
+                gnn_feat = gnn_feat.reshape(-1)
+                if gnn_feat.numel() < self.gnn_out_dim:
+                    pad = torch.zeros(self.gnn_out_dim - gnn_feat.numel(), device=states.device)
+                    gnn_feat = torch.cat([gnn_feat, pad], dim=0)
+                else:
+                    gnn_feat = gnn_feat[: self.gnn_out_dim]
+            gnn_features.append(gnn_feat.to(states.device))
+        gnn_features_tensor = torch.stack(gnn_features, dim=0)
+        return torch.cat([base_states, gnn_features_tensor], dim=-1)
+
     def _update_learning_rate(self) -> None:
         """更新学习率（线性衰减）."""
         if self.config.lr_schedule == "linear" and self._total_timesteps > 0:
@@ -280,7 +349,7 @@ class PPOAgent:
 
     def save(self, path: str) -> None:
         """保存模型."""
-        torch.save({
+        checkpoint = {
             "actor_critic_state_dict": self.actor_critic.state_dict(),
             "optimizer_state_dict": self.optimizer.state_dict(),
             "config": self.config,
@@ -288,7 +357,12 @@ class PPOAgent:
             "num_layers": self.num_layers,
             "num_domains": self.num_domains,
             "train_stats": self.train_stats,
-        }, path)
+        }
+        if self.gnn_encoder is not None:
+            gnn_state = self.gnn_encoder.state_dict()
+            if gnn_state is not None:
+                checkpoint["gnn_state_dict"] = gnn_state
+        torch.save(checkpoint, path)
 
     def load(self, path: str) -> None:
         """加载模型."""
@@ -296,6 +370,8 @@ class PPOAgent:
         self.actor_critic.load_state_dict(checkpoint["actor_critic_state_dict"])
         self.optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
         self.train_stats = checkpoint.get("train_stats", self.train_stats)
+        if self.gnn_encoder is not None and "gnn_state_dict" in checkpoint:
+            self.gnn_encoder.load_state_dict(checkpoint["gnn_state_dict"])
 
     def get_cut_points(self, state: np.ndarray) -> List[int]:
         """获取切分点（用于与现有接口兼容）.
