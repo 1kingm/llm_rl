@@ -416,6 +416,22 @@ def generate_workload_et(
                         prev_id = node_id
                         node_id += 1
 
+            if node_id == 0:
+                # Ensure each NPU has at least one node to avoid empty trace crashes.
+                idle_node = et_def_pb2.Node()
+                idle_node.id = node_id
+                idle_node.name = "idle_compute"
+                idle_node.type = et_def_pb2.COMP_NODE
+                idle_node.duration_micros = 1
+                idle_node.attr.extend(
+                    [
+                        et_def_pb2.AttributeProto(name="is_cpu_op", bool_val=False),
+                        et_def_pb2.AttributeProto(name="num_ops", uint64_val=1),
+                        et_def_pb2.AttributeProto(name="tensor_size", uint64_val=1),
+                    ]
+                )
+                protolib.encodeMessage(handle, idle_node)
+
     return prefix
 
 
