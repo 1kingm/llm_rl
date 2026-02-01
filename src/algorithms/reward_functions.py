@@ -402,12 +402,14 @@ class RewardCalculator:
                     ratio = low_bw_edges / cross_edges
                     constraint_penalty += self.constraints.bandwidth_penalty * ratio
 
-        # 总奖励: 效率 + 利用率 - 成本
+        weighted_constraint = self.constraints.constraint_weight * constraint_penalty
+
+        # 总奖励: 效率 + 利用率 - 成本 - 约束惩罚
         reward = (
             self.weights.w_eff * r_eff
             + self.weights.w_util * r_util
             - self.weights.w_cost * r_cost
-            - self.constraints.constraint_weight * constraint_penalty
+            - weighted_constraint
         )
 
         return RewardBreakdown(
@@ -415,5 +417,5 @@ class RewardCalculator:
             r_util=r_util,
             r_cost=r_cost,
             reward=reward,
-            r_constraint=constraint_penalty,
+            r_constraint=weighted_constraint,
         )
