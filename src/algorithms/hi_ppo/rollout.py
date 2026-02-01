@@ -65,6 +65,7 @@ def run_rollout(
                     reward=reward_breakdown,
                     network_state=network_state_used,
                     weights=weights,
+                    total_domains=getattr(env, "config", None).num_domains if getattr(env, "config", None) else None,
                 )
                 info["explanation"] = explanation
 

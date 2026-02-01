@@ -526,6 +526,7 @@ class HiPPOTrainer:
             reward=reward_breakdown,
             network_state=network_state,
             weights=weights,
+            total_domains=self.env_config.num_domains,
         )
 
         # 更新统计

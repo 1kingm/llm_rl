@@ -18,6 +18,7 @@ except ImportError:  # pragma: no cover - optional dependency
 from ..algorithms.reward_functions import (
     RewardBaselines,
     RewardCalculator,
+    RewardConstraints,
     RewardWeights,
     compute_cross_domain_comm,
 )
@@ -59,6 +60,7 @@ class EnvConfig:
     ns3_logical_topology_dims: Optional[List[int]] = None
     remote_mem_config: str = "astra-sim/examples/remote_memory/analytical/no_memory_expansion.json"
     reward_weights: RewardWeights = field(default_factory=RewardWeights)
+    reward_constraints: RewardConstraints = field(default_factory=RewardConstraints)
     peak_perf_tflops: float = 120.0
     local_mem_bw_gbps: float = 1600.0
     layer_runtime_us: int = 100
@@ -152,10 +154,12 @@ class AstraSimEnv(BaseEnv):
             )
 
         reward_weights = self.config.reward_weights or RewardWeights()
+        reward_constraints = self.config.reward_constraints or RewardConstraints()
         self.reward_calculator = RewardCalculator(
             weights=reward_weights,
             baselines=baselines,
             num_domains=self.config.num_domains,
+            constraints=reward_constraints,
         )
         self.current_network_state: Optional[NetworkState] = None
         self._last_domain_loads: List[float] = self._default_domain_loads()
@@ -255,7 +259,14 @@ class AstraSimEnv(BaseEnv):
 
         output_path = Path(self.config.results_path)
         if self.config.use_mock:
-            mock_run(output_path, placement, comm_size_bytes=self.config.comm_size_bytes)
+            mock_run(
+                output_path,
+                placement,
+                comm_size_bytes=self.config.comm_size_bytes,
+                seed=self.config.seed,
+                num_domains=self.config.num_domains,
+                layer_runtime_us=self.config.layer_runtime_us,
+            )
         else:
             remote_mem_cfg = Path(self.config.remote_mem_config)
             if not remote_mem_cfg.exists():
@@ -305,6 +316,7 @@ class AstraSimEnv(BaseEnv):
             metrics,
             placement=placement,
             comm_size_bytes=self.config.comm_size_bytes,
+            network_state=self.current_network_state,
         )
 
         # 自适应更新 baseline

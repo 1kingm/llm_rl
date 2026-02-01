@@ -69,21 +69,30 @@ def summarize_reward(
     eff_contrib = weights["w_eff"] * reward.r_eff
     util_contrib = weights["w_util"] * reward.r_util
     cost_contrib = weights["w_cost"] * reward.r_cost
+    constraint_contrib = reward.r_constraint
 
-    total_abs = abs(eff_contrib) + abs(util_contrib) + abs(cost_contrib)
+    total_abs = (
+        abs(eff_contrib)
+        + abs(util_contrib)
+        + abs(cost_contrib)
+        + abs(constraint_contrib)
+    )
 
     if total_abs > 0:
         eff_pct = abs(eff_contrib) / total_abs * 100
         util_pct = abs(util_contrib) / total_abs * 100
         cost_pct = abs(cost_contrib) / total_abs * 100
+        constraint_pct = abs(constraint_contrib) / total_abs * 100
     else:
         eff_pct = util_pct = cost_pct = 33.3
+        constraint_pct = 0.0
 
     # 确定主导因素
     contributions = {
         "efficiency": abs(eff_contrib),
         "utilization": abs(util_contrib),
         "cost": abs(cost_contrib),
+        "constraint": abs(constraint_contrib),
     }
     dominant = max(contributions, key=lambda k: contributions[k])
 
@@ -91,10 +100,12 @@ def summarize_reward(
         "r_eff": reward.r_eff,
         "r_util": reward.r_util,
         "r_cost": reward.r_cost,
+        "r_constraint": reward.r_constraint,
         "reward": reward.reward,
         "eff_contribution_pct": eff_pct,
         "util_contribution_pct": util_pct,
         "cost_contribution_pct": cost_pct,
+        "constraint_contribution_pct": constraint_pct,
         "dominant_factor": dominant,
     }
 
@@ -165,7 +176,7 @@ def rule_summary(
     return items
 
 
-def analyze_placement(placement: List[int]) -> Dict[str, Any]:
+def analyze_placement(placement: List[int], total_domains: Optional[int] = None) -> Dict[str, Any]:
     """分析放置策略.
 
     Args:
@@ -184,12 +195,16 @@ def analyze_placement(placement: List[int]) -> Dict[str, Any]:
         }
 
     num_layers = len(placement)
-    num_domains = max(placement) + 1 if placement else 0
+    if total_domains is None:
+        num_domains = max(placement) + 1 if placement else 0
+    else:
+        num_domains = total_domains
 
     # 统计每个域的层数
     layers_per_domain = [0] * num_domains
     for domain_id in placement:
-        layers_per_domain[domain_id] += 1
+        if 0 <= domain_id < num_domains:
+            layers_per_domain[domain_id] += 1
 
     # 计算跨域切分次数
     cross_cuts = sum(1 for i in range(1, num_layers) if placement[i] != placement[i-1])
@@ -235,6 +250,7 @@ def generate_summary_text(
     lines.append(f"  - 效率: {reward_summary.get('r_eff', 0):.4f} ({reward_summary.get('eff_contribution_pct', 0):.1f}%)")
     lines.append(f"  - 利用率: {reward_summary.get('r_util', 0):.4f} ({reward_summary.get('util_contribution_pct', 0):.1f}%)")
     lines.append(f"  - 成本: {reward_summary.get('r_cost', 0):.4f} ({reward_summary.get('cost_contribution_pct', 0):.1f}%)")
+    lines.append(f"  - 约束惩罚: {reward_summary.get('r_constraint', 0):.4f} ({reward_summary.get('constraint_contribution_pct', 0):.1f}%)")
     lines.append(f"  - 主导因素: {reward_summary.get('dominant_factor', 'unknown')}")
 
     # 放置摘要
@@ -260,6 +276,7 @@ def build_explanation(
     avg_inter_bandwidth_gbps: Optional[float] = None,
     avg_inter_latency_ms: Optional[float] = None,
     weights: Optional[Dict[str, float]] = None,
+    total_domains: Optional[int] = None,
 ) -> Dict[str, Any]:
     """组装完整的解释载荷.
 
@@ -292,7 +309,7 @@ def build_explanation(
     )]
 
     # 放置分析
-    placement_analysis = analyze_placement(placement)
+    placement_analysis = analyze_placement(placement, total_domains=total_domains)
 
     # 生成摘要文本
     summary = generate_summary_text(reward_summary, placement_analysis, rules)

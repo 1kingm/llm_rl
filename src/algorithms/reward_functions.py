@@ -6,7 +6,7 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import List, Optional, Tuple
 
-from ..utils.types import RewardBreakdown, RunMetrics
+from ..utils.types import NetworkState, RewardBreakdown, RunMetrics
 
 
 class WeightPreset(Enum):
@@ -121,6 +121,26 @@ class RewardWeights:
     def to_tuple(self) -> Tuple[float, float, float]:
         """转换为元组."""
         return (self.w_eff, self.w_util, self.w_cost)
+
+
+@dataclass
+class RewardConstraints:
+    """奖励约束配置（惩罚项）."""
+
+    # 约束 1：最少启用域数，避免退化到单域
+    min_active_domains: int = 2
+    active_domain_penalty: float = 0.3  # 低于最少域数时的惩罚强度
+
+    # 约束 2：负载均衡下限
+    balance_target: float = 0.6
+    balance_penalty: float = 0.3  # 低于目标时的惩罚强度
+
+    # 约束 3：低带宽跨域切分惩罚
+    bandwidth_threshold_gbps: float = 3.0
+    bandwidth_penalty: float = 0.2
+
+    # 约束整体缩放
+    constraint_weight: float = 1.0
 
 
 @dataclass
@@ -296,16 +316,19 @@ class RewardCalculator:
         weights: RewardWeights | None = None,
         baselines: RewardBaselines | None = None,
         num_domains: Optional[int] = None,
+        constraints: RewardConstraints | None = None,
     ) -> None:
         self.weights = weights or RewardWeights()
         self.baselines = baselines or RewardBaselines()
         self.num_domains = num_domains
+        self.constraints = constraints or RewardConstraints()
 
     def compute(
         self,
         metrics: RunMetrics,
         placement: Optional[List[int]] = None,
         comm_size_bytes: Optional[int] = None,
+        network_state: Optional[NetworkState] = None,
     ) -> RewardBreakdown:
         """计算奖励分解.
 
@@ -338,19 +361,59 @@ class RewardCalculator:
             r_cost = metrics.cross_domain_comm_gb / max(1.0, self.baselines.baseline_comm_gb)
 
         # 基于放置的奖励修正：鼓励均衡、惩罚过多跨域切分
+        constraint_penalty = 0.0
+
         if placement is not None:
-            balance_score = _balance_score(placement, self.num_domains)
+            total_domains = self.num_domains or (max(placement) + 1)
+            balance_score = _balance_score(placement, total_domains)
+            # 利用率按均衡度缩放（均衡低时利用率有效值下降）
             r_util = metrics.utilization * (0.5 + 0.5 * balance_score)
+
             cross_edges = _count_cross_edges(placement)
-            denom = max(1, (self.num_domains or (max(placement) + 1)) - 1)
+            denom = max(1, total_domains - 1)
             cut_ratio = cross_edges / denom
             r_cost = r_cost * (1.0 + cut_ratio)
+
+            # 约束 1：最少启用域数
+            active_domains = len(set(placement))
+            min_active = max(1, self.constraints.min_active_domains)
+            if active_domains < min_active:
+                deficit = (min_active - active_domains) / min_active
+                constraint_penalty += self.constraints.active_domain_penalty * deficit
+
+            # 约束 2：均衡度下限
+            if balance_score < self.constraints.balance_target:
+                gap = (self.constraints.balance_target - balance_score) / max(
+                    self.constraints.balance_target, 1e-6
+                )
+                constraint_penalty += self.constraints.balance_penalty * gap
+
+            # 约束 3：低带宽跨域切分惩罚
+            if network_state is not None and cross_edges > 0:
+                low_bw_edges = 0
+                for idx in range(len(placement) - 1):
+                    src = placement[idx]
+                    dst = placement[idx + 1]
+                    if src != dst:
+                        bw = network_state.bandwidth_gbps[src][dst]
+                        if bw < self.constraints.bandwidth_threshold_gbps:
+                            low_bw_edges += 1
+                if low_bw_edges:
+                    ratio = low_bw_edges / cross_edges
+                    constraint_penalty += self.constraints.bandwidth_penalty * ratio
 
         # 总奖励: 效率 + 利用率 - 成本
         reward = (
             self.weights.w_eff * r_eff
             + self.weights.w_util * r_util
             - self.weights.w_cost * r_cost
+            - self.constraints.constraint_weight * constraint_penalty
         )
 
-        return RewardBreakdown(r_eff=r_eff, r_util=r_util, r_cost=r_cost, reward=reward)
+        return RewardBreakdown(
+            r_eff=r_eff,
+            r_util=r_util,
+            r_cost=r_cost,
+            reward=reward,
+            r_constraint=constraint_penalty,
+        )

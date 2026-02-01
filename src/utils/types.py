@@ -27,3 +27,4 @@ class RewardBreakdown:
     r_util: float
     r_cost: float
     reward: float
+    r_constraint: float = 0.0

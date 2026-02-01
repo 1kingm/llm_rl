@@ -32,7 +32,7 @@ from src.algorithms.hi_ppo import (
     HiPPOTrainer,
     train_hi_ppo,
 )
-from src.algorithms.reward_functions import RewardWeights
+from src.algorithms.reward_functions import RewardConstraints, RewardWeights
 from src.utils.gnn_encoder import GNNConfig
 
 
@@ -50,6 +50,19 @@ def create_configs_from_yaml(yaml_config: dict) -> tuple:
         w_eff=reward_cfg.get("w_eff", default_weights.w_eff),
         w_util=reward_cfg.get("w_util", default_weights.w_util),
         w_cost=reward_cfg.get("w_cost", default_weights.w_cost),
+    )
+    constraint_cfg = yaml_config.get("reward_constraints", {})
+    default_constraints = RewardConstraints()
+    reward_constraints = RewardConstraints(
+        min_active_domains=constraint_cfg.get("min_active_domains", default_constraints.min_active_domains),
+        active_domain_penalty=constraint_cfg.get("active_domain_penalty", default_constraints.active_domain_penalty),
+        balance_target=constraint_cfg.get("balance_target", default_constraints.balance_target),
+        balance_penalty=constraint_cfg.get("balance_penalty", default_constraints.balance_penalty),
+        bandwidth_threshold_gbps=constraint_cfg.get(
+            "bandwidth_threshold_gbps", default_constraints.bandwidth_threshold_gbps
+        ),
+        bandwidth_penalty=constraint_cfg.get("bandwidth_penalty", default_constraints.bandwidth_penalty),
+        constraint_weight=constraint_cfg.get("constraint_weight", default_constraints.constraint_weight),
     )
 
     # 环境配置
@@ -69,6 +82,7 @@ def create_configs_from_yaml(yaml_config: dict) -> tuple:
         ns3_comm_group_config=env_cfg.get("ns3_comm_group_config", EnvConfig().ns3_comm_group_config),
         ns3_logical_topology_dims=env_cfg.get("ns3_logical_topology_dims"),
         reward_weights=reward_weights,
+        reward_constraints=reward_constraints,
         seed=yaml_config.get("seed", 42),
     )
 
