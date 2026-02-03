@@ -8,7 +8,7 @@
 - 协调器 (coordinator.py)
 """
 
-from .global_agent import GlobalAgent, RandomGlobalAgent
+from .global_agent import GlobalAgent, RandomGlobalAgent, PPOGlobalAgent
 from .local_agent import LocalAgent, NoOpLocalAgent
 from .coordinator import CoordinatorConfig, HiPPOCoordinator
 from .rollout import run_rollout
@@ -21,6 +21,7 @@ __all__ = [
     # 基础接口
     "GlobalAgent",
     "RandomGlobalAgent",
+    "PPOGlobalAgent",
     "LocalAgent",
     "NoOpLocalAgent",
     "CoordinatorConfig",

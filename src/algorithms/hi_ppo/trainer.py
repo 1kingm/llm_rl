@@ -34,6 +34,9 @@ from ...envs.astra_env import AstraSimEnv, EnvConfig
 from ...utils.explainability import build_explanation
 from ...utils.gnn_encoder import GNNEncoder, GNNConfig
 from .ppo_agent import PPOAgent, PPOConfig
+from .global_agent import PPOGlobalAgent
+from .local_agent import NoOpLocalAgent
+from .coordinator import CoordinatorConfig, HiPPOCoordinator
 from .networks import NetworkConfig
 
 
@@ -64,6 +67,7 @@ class TrainerConfig:
     # 其他
     seed: int = 42
     verbose: int = 1  # 0: 无输出, 1: 进度, 2: 详细
+    use_hierarchical: bool = False  # 是否使用分层 Hi-PPO 训练路径
 
 
 @dataclass
@@ -148,6 +152,25 @@ class HiPPOTrainer:
             train_gnn=train_gnn,
         )
 
+        # 分层模式协调器
+        self.use_hierarchical = bool(trainer_config.use_hierarchical)
+        self.global_agent: Optional[PPOGlobalAgent] = None
+        self.local_agent: Optional[NoOpLocalAgent] = None
+        self.coordinator: Optional[HiPPOCoordinator] = None
+        if self.use_hierarchical:
+            self.global_agent = PPOGlobalAgent(self.agent)
+            self.local_agent = NoOpLocalAgent()
+            self.coordinator = HiPPOCoordinator(
+                CoordinatorConfig(
+                    num_layers=env_config.num_layers,
+                    num_domains=env_config.num_domains,
+                ),
+                global_agent=self.global_agent,
+                local_agent=self.local_agent,
+                gnn_config=self.gnn_config,
+                gnn_encoder=self.gnn_encoder,
+            )
+
         # 训练统计
         self.stats = TrainingStats()
         self._live_log_file: Optional[object] = None
@@ -188,6 +211,43 @@ class HiPPOTrainer:
             # 填充零向量
             h_topo = np.zeros(self.gnn_config.out_dim, dtype=np.float32)
             return np.concatenate([base_state, h_topo])
+
+    @staticmethod
+    def _interval_due(interval: Optional[int], steps_per_rollout: int, timesteps: int) -> bool:
+        if interval is None or interval <= 0:
+            return False
+        return (timesteps % interval) < steps_per_rollout
+
+    def _build_local_states(
+        self,
+        network_state,
+        domain_loads: Optional[List[float]],
+    ) -> List[List[float]]:
+        """构建域内状态（供下层策略使用）."""
+        num_domains = self.env_config.num_domains
+        if domain_loads is None or len(domain_loads) != num_domains:
+            domain_loads = self.env._default_domain_loads()
+
+        if network_state is None:
+            return [[domain_loads[i], 0.0, 0.0] for i in range(num_domains)]
+
+        local_states: List[List[float]] = []
+        for i in range(num_domains):
+            bw_row = [
+                network_state.bandwidth_gbps[i][j]
+                for j in range(num_domains)
+                if j != i
+            ]
+            lat_row = [
+                network_state.latency_ms[i][j]
+                for j in range(num_domains)
+                if j != i
+            ]
+            avg_bw = float(np.mean(bw_row)) if bw_row else 0.0
+            avg_lat = float(np.mean(lat_row)) if lat_row else 0.0
+            local_states.append([domain_loads[i], avg_bw, avg_lat])
+
+        return local_states
 
     def train(self, callback: Optional[Callable[[TrainingStats], bool]] = None) -> TrainingStats:
         """执行训练.
@@ -237,14 +297,25 @@ class HiPPOTrainer:
                     # 收集 rollout
                     for _ in range(config.steps_per_rollout):
                         step_id = self.stats.timesteps + 1
-                        if config.verbose >= 2 and config.log_interval > 0 and step_id % config.log_interval == 0:
+                        if config.verbose >= 2 and config.log_interval and config.log_interval > 0 and step_id % config.log_interval == 0:
                             print(f"[Step {step_id}] started", flush=True)
                             self._write_live_log(f"[Step {step_id}] started")
                         # 选择动作
-                        action, log_prob, value = self.agent.select_action(state)
-
-                        # 将切分点转换为放置向量
-                        placement = self._cut_points_to_placement(action.tolist())
+                        if self.use_hierarchical and self.coordinator is not None and self.global_agent is not None:
+                            domain_loads = getattr(self.env, "_last_domain_loads", None)
+                            state_low = self._build_local_states(self.env.current_network_state, domain_loads)
+                            placement = self.coordinator.select_action(
+                                state_high=state,
+                                state_low=state_low,
+                                network_state=None,
+                                domain_loads=domain_loads,
+                                deterministic=False,
+                            )
+                            action, log_prob, value = self.global_agent.get_last_transition()
+                        else:
+                            action, log_prob, value = self.agent.select_action(state)
+                            # 将切分点转换为放置向量
+                            placement = self._cut_points_to_placement(action.tolist())
 
                         # 执行动作
                         next_obs, reward, terminated, truncated, info = self.env.step(placement)
@@ -311,11 +382,11 @@ class HiPPOTrainer:
                     self.stats.update_stats.append(update_stats)
 
                     # 日志
-                    if self.stats.timesteps % config.log_interval < config.steps_per_rollout:
+                    if self._interval_due(config.log_interval, config.steps_per_rollout, self.stats.timesteps):
                         self._log_progress(update_stats)
 
                     # 评估
-                    if self.stats.timesteps % config.eval_interval < config.steps_per_rollout:
+                    if self._interval_due(config.eval_interval, config.steps_per_rollout, self.stats.timesteps):
                         eval_reward = self._evaluate()
                         self.stats.eval_rewards.append(eval_reward)
                         if config.verbose >= 1:
@@ -325,7 +396,7 @@ class HiPPOTrainer:
                             )
 
                     # 保存
-                    if self.stats.timesteps % config.save_interval < config.steps_per_rollout:
+                    if self._interval_due(config.save_interval, config.steps_per_rollout, self.stats.timesteps):
                         self._save_checkpoint()
 
                     # 回调
@@ -414,25 +485,49 @@ class HiPPOTrainer:
         Returns:
             平均奖励
         """
+        actor_was_training = self.agent.actor_critic.training
+        if actor_was_training:
+            self.agent.actor_critic.eval()
+        if self.agent.gnn_trainable and self.gnn_encoder is not None:
+            self.gnn_encoder.eval()
+
         rewards = []
 
-        for _ in range(num_episodes):
-            obs, _ = self.env.reset()
-            state = self._augment_state(obs, self.env.current_network_state)
-            episode_reward = 0.0
-            done = False
+        try:
+            for _ in range(num_episodes):
+                obs, _ = self.env.reset()
+                state = self._augment_state(obs, self.env.current_network_state)
+                episode_reward = 0.0
+                done = False
 
-            while not done:
-                action, _, _ = self.agent.select_action(state, deterministic=True)
-                placement = self._cut_points_to_placement(action.tolist())
-                next_obs, reward, terminated, truncated, _ = self.env.step(placement)
-                done = terminated or truncated
-                state = self._augment_state(next_obs, self.env.current_network_state)
-                episode_reward += reward
+                while not done:
+                    if self.use_hierarchical and self.coordinator is not None:
+                        domain_loads = getattr(self.env, "_last_domain_loads", None)
+                        state_low = self._build_local_states(self.env.current_network_state, domain_loads)
+                        placement = self.coordinator.select_action(
+                            state_high=state,
+                            state_low=state_low,
+                            network_state=None,
+                            domain_loads=domain_loads,
+                            deterministic=True,
+                        )
+                    else:
+                        action, _, _ = self.agent.select_action(state, deterministic=True)
+                        placement = self._cut_points_to_placement(action.tolist())
 
-            rewards.append(episode_reward)
+                    next_obs, reward, terminated, truncated, _ = self.env.step(placement)
+                    done = terminated or truncated
+                    state = self._augment_state(next_obs, self.env.current_network_state)
+                    episode_reward += reward
 
-        return np.mean(rewards)
+                rewards.append(episode_reward)
+
+            return np.mean(rewards)
+        finally:
+            if actor_was_training:
+                self.agent.actor_critic.train()
+            if self.agent.gnn_trainable and self.gnn_encoder is not None:
+                self.gnn_encoder.train()
 
     def _log_progress(self, update_stats: Dict[str, float]) -> None:
         """记录训练进度."""

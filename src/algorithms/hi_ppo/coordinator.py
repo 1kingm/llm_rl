@@ -26,11 +26,12 @@ class HiPPOCoordinator:
         global_agent: GlobalAgent,
         local_agent: LocalAgent,
         gnn_config: GNNConfig | None = None,
+        gnn_encoder: GNNEncoder | None = None,
     ) -> None:
         self.config = config
         self.global_agent = global_agent
         self.local_agent = local_agent
-        self.gnn_encoder = GNNEncoder(gnn_config or GNNConfig())
+        self.gnn_encoder = gnn_encoder or GNNEncoder(gnn_config or GNNConfig())
 
     def select_action(
         self,
@@ -38,6 +39,7 @@ class HiPPOCoordinator:
         state_low: Iterable[Iterable[float]],
         network_state: NetworkState | None = None,
         domain_loads: Optional[List[float]] = None,
+        deterministic: bool = False,
     ) -> List[int]:
         state_high_vec = list(state_high)
         if network_state is not None:
@@ -45,7 +47,7 @@ class HiPPOCoordinator:
             h_topo = self.gnn_encoder.encode(graph)
             state_high_vec = state_high_vec + h_topo
 
-        cut_points = self.global_agent.select_action(state_high_vec)
+        cut_points = self.global_agent.select_action(state_high_vec, deterministic=deterministic)
         placement = self._cut_points_to_placement(cut_points)
         # Local agent can be used to refine per-domain placement later.
         _ = state_low

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import logging
 import csv
 from pathlib import Path
 import random
@@ -56,6 +57,8 @@ class EnvConfig:
     ns3_bin: str = "astra-sim/extern/network_backend/ns-3-src/build/scratch/ns3.42-AstraSimNetwork-default"
     ns3_build_dir: str = "astra-sim/extern/network_backend/ns-3-src/build/scratch"
     ns3_network_config: str = "astra-sim/extern/network_backend/ns-3-src/scratch/config/config_clos.txt"
+    ns3_dynamic_topology: bool = True
+    ns3_topology_error_rate: float = 0.0
     ns3_comm_group_config: str = "empty"
     ns3_logical_topology_dims: Optional[List[int]] = None
     remote_mem_config: str = "astra-sim/examples/remote_memory/analytical/no_memory_expansion.json"
@@ -210,7 +213,10 @@ class AstraSimEnv(BaseEnv):
         out_dir.mkdir(parents=True, exist_ok=True)
         backend = self.config.backend.lower()
         if backend == "ns3":
-            network_cfg = Path(self.config.ns3_network_config)
+            if self.config.ns3_dynamic_topology:
+                network_cfg = self._prepare_ns3_network_config(out_dir, network_state)
+            else:
+                network_cfg = Path(self.config.ns3_network_config)
         else:
             network_cfg = self._write_network_config(out_dir / "network_config.yml", network_state)
 
@@ -448,6 +454,90 @@ class AstraSimEnv(BaseEnv):
             bandwidth_gbps=agg_bw,
             latency_ms=agg_lat,
         )
+
+    def _prepare_ns3_network_config(self, out_dir: Path, network_state: NetworkState) -> Path:
+        """为 NS3 后端生成动态网络配置."""
+        topo_path = out_dir / "ns3_topology.txt"
+        self._write_ns3_topology(topo_path, network_state)
+
+        base_cfg = Path(self.config.ns3_network_config)
+        out_cfg = out_dir / "ns3_network_config.txt"
+        if base_cfg.exists():
+            return self._write_ns3_config_with_topology(base_cfg, out_cfg, topo_path)
+
+        logging.getLogger(__name__).warning(
+            "NS3 network config not found at %s; generating minimal config with TOPOLOGY_FILE.",
+            base_cfg,
+        )
+        return self._write_ns3_config_minimal(out_cfg, topo_path)
+
+    def _write_ns3_config_with_topology(self, template_path: Path, out_path: Path, topo_path: Path) -> Path:
+        """从模板生成 NS3 配置，并替换 TOPOLOGY_FILE."""
+        content = template_path.read_text(encoding="utf-8")
+        lines = content.splitlines()
+        replaced = False
+        new_lines: List[str] = []
+        topo_value = str(topo_path.resolve())
+
+        for line in lines:
+            stripped = line.strip()
+            if not stripped or stripped.startswith("#") or stripped.startswith("//"):
+                new_lines.append(line)
+                continue
+            if stripped.upper().startswith("TOPOLOGY_FILE"):
+                if "=" in line:
+                    prefix = line.split("=", 1)[0].strip()
+                    new_lines.append(f"{prefix} = {topo_value}")
+                elif ":" in line:
+                    prefix = line.split(":", 1)[0].strip()
+                    new_lines.append(f"{prefix}: {topo_value}")
+                else:
+                    key = stripped.split()[0]
+                    new_lines.append(f"{key} {topo_value}")
+                replaced = True
+            else:
+                new_lines.append(line)
+
+        if not replaced:
+            new_lines.append(f"TOPOLOGY_FILE = {topo_value}")
+
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        out_path.write_text("\n".join(new_lines) + "\n", encoding="utf-8")
+        return out_path
+
+    def _write_ns3_config_minimal(self, out_path: Path, topo_path: Path) -> Path:
+        """生成仅包含 TOPOLOGY_FILE 的最小 NS3 配置."""
+        topo_value = str(topo_path.resolve())
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        out_path.write_text(f"TOPOLOGY_FILE = {topo_value}\n", encoding="utf-8")
+        return out_path
+
+    def _write_ns3_topology(self, path: Path, network_state: NetworkState) -> Path:
+        """根据网络状态生成 NS3 物理拓扑文件."""
+        num_nodes = self.config.num_domains
+        num_switches = 0
+        links: List[Tuple[int, int, float, float]] = []
+
+        for i in range(num_nodes):
+            for j in range(i + 1, num_nodes):
+                bw_ij = network_state.bandwidth_gbps[i][j]
+                bw_ji = network_state.bandwidth_gbps[j][i]
+                lat_ij = network_state.latency_ms[i][j]
+                lat_ji = network_state.latency_ms[j][i]
+                bw = max(1e-6, (bw_ij + bw_ji) / 2.0)
+                lat = max(1e-6, (lat_ij + lat_ji) / 2.0)
+                links.append((i, j, bw, lat))
+
+        num_links = len(links)
+        lines = [f"{num_nodes} {num_switches} {num_links}\n", "\n"]
+
+        error_rate = float(self.config.ns3_topology_error_rate)
+        for src, dst, bw, lat in links:
+            lines.append(f"{src} {dst} {bw:.6f}Gbps {lat:.6f}ms {error_rate}\n")
+
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("".join(lines), encoding="utf-8")
+        return path
 
     @staticmethod
     def _aggregate_offdiag(matrix: List[List[float]], mode: str) -> float:

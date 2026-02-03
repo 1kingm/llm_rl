@@ -3,7 +3,7 @@
   "collective-optimization": "localBWAware",
   "endpoint-delay": 10,
   "active-chunks-per-dimension": 1,
-  "preferred-dataset-splits": 3,
+  "preferred-dataset-splits": 5,
   "local-mem-bw": 1600.0,
   "peak-perf": 120.0,
   "roofline-enabled": 1,
